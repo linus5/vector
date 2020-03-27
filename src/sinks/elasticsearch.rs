@@ -4,14 +4,16 @@ use crate::{
     sinks::util::{
         encoding::{EncodingConfigWithDefault, EncodingConfiguration},
         http::{BatchedHttpSink, HttpClient, HttpSink},
+        retries::{RetryAction, RetryLogic},
         BatchBytesConfig, Buffer, Compression, TowerRequestConfig,
     },
     template::Template,
     tls::{TlsOptions, TlsSettings},
     topology::config::{DataType, SinkConfig, SinkContext, SinkDescription},
 };
+use bytes::Bytes;
 use futures01::Future;
-use http::{uri::InvalidUri, Uri};
+use http::{status::StatusCode, uri::InvalidUri, Uri};
 use hyper::{
     header::{HeaderName, HeaderValue},
     Body, Request,
@@ -21,7 +23,7 @@ use rusoto_core::signature::{SignedRequest, SignedRequestPayload};
 use rusoto_core::{DefaultCredentialsProvider, ProvideAwsCredentials, Region};
 use rusoto_credential::{AwsCredentials, CredentialsError};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use snafu::{ResultExt, Snafu};
 use std::collections::HashMap;
 use tower::Service;
@@ -100,8 +102,15 @@ impl SinkConfig for ElasticSearchConfig {
         let gzip = matches!(&self.compression, Some(Compression::Gzip) | None)
             && common.credentials.is_none();
 
-        let sink =
-            BatchedHttpSink::new(common, Buffer::new(gzip), request, batch, tls_settings, &cx);
+        let sink = BatchedHttpSink::with_retry_logic(
+            common,
+            Buffer::new(gzip),
+            ElasticSearchRetryLogic,
+            request,
+            batch,
+            tls_settings,
+            &cx,
+        );
 
         Ok((Box::new(sink), healthcheck))
     }
@@ -226,6 +235,45 @@ impl HttpSink for ElasticSearchCommon {
             }
 
             builder.body(events).unwrap()
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ElasticSearchRetryLogic;
+
+impl RetryLogic for ElasticSearchRetryLogic {
+    type Error = hyper::Error;
+    type Response = hyper::Response<Bytes>;
+
+    fn is_retriable_error(&self, error: &Self::Error) -> bool {
+        error.is_connect() || error.is_closed()
+    }
+
+    fn should_retry_response(&self, response: &Self::Response) -> RetryAction {
+        let status = response.status();
+
+        match status {
+            StatusCode::TOO_MANY_REQUESTS => RetryAction::Retry("Too many requests".into()),
+            StatusCode::NOT_IMPLEMENTED => {
+                RetryAction::DontRetry("endpoint not implemented".into())
+            }
+            _ if status.is_server_error() => RetryAction::Retry(
+                format!("{}: {}", status, String::from_utf8_lossy(response.body())).into(),
+            ),
+            _ if status.is_success() => {
+                let body = String::from_utf8_lossy(response.body());
+                match body.find("\"errors\":true") {
+                    Some(_) => match serde_json::from_str::<Value>(&body) {
+                        Err(_) => RetryAction::DontRetry(
+                            "some messages failed, and invalid response from elasticsearch".into(),
+                        ),
+                        Ok(_data) => RetryAction::DontRetry("some messages failed".into()),
+                    },
+                    None => RetryAction::Successful,
+                }
+            }
+            _ => RetryAction::DontRetry(format!("response status: {}", status)),
         }
     }
 }
